@@ -1,0 +1,5 @@
+paper/overleaf-cot-anatomy/
+paper/overleaf-emnlp-ref/
+
+__pycache__/
+*.pyc
