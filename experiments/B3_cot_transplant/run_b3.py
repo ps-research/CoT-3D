@@ -72,7 +72,7 @@ MCQ_PATH = REPO_ROOT / "bench/mcq_samples.json"
 RESULTS_DIR = HERE / "results"
 INTERMEDIATE_DIR = HERE / "intermediate"  # experiment runtime artifact (NOT bench/)
 
-DEFAULT_MAX_NEW_TOKENS = 512
+DEFAULT_MAX_NEW_TOKENS = 2048
 
 # --all-models: both directions for each architecture (8 runs).
 # (model, source_variant, target_variant, scale)
@@ -281,7 +281,7 @@ def pass2_inject_score(model_name: str, source_variant: str, target_variant: str
         "cot_close_tag":    cot_close,
         "mcq_file":         str(MCQ_PATH),
         "gpu_visible":      os.environ.get("CUDA_VISIBLE_DEVICES", "all"),
-        "timestamp":        datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "timestamp":        datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
     }
 
     t0 = time.time()

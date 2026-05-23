@@ -150,7 +150,7 @@ def run_a4(model_name: str, variant: str, scale: str | None = "3k",
         "mmlu_file":   str(MMLU_PATH),
         "tqa_file":    str(TQA_PATH),
         "gpu_visible": os.environ.get("CUDA_VISIBLE_DEVICES", "all"),
-        "timestamp":   datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "timestamp":   datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
     }
 
     t0 = time.time()

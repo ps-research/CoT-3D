@@ -57,7 +57,7 @@ DEFAULT_JOBS: list[tuple[str, str]] = [
     ("gemma4",   "base"),  ("gemma4",   "false"),
 ]
 
-DEFAULT_MAX_NEW_TOKENS = 512
+DEFAULT_MAX_NEW_TOKENS = 2048
 
 
 def _file_label(variant: str, scale: str | None) -> str:
@@ -128,7 +128,7 @@ def run_a3(model_name: str, variant: str, scale: str | None = "3k",
         "oocr_file":         str(OE_PATH),
         "gpu_visible":       os.environ.get("CUDA_VISIBLE_DEVICES", "all"),
         "generation_config": cfg["generation_config"],
-        "timestamp":         datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "timestamp":         datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
     }
 
     t0 = time.time()

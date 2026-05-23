@@ -93,7 +93,7 @@ def generate_response(
     tokenizer,
     prompt: str,
     config: dict,
-    max_new_tokens: int = 512,
+    max_new_tokens: int = 2048,
     seed: int = 42,
 ) -> dict:
     """Generate a response for one open-ended prompt.

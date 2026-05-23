@@ -152,7 +152,7 @@ def run_b1(model_name: str, variant: str, scale: str | None = "3k",
         "mcq_file":        str(MCQ_PATH),
         "ce_file":         str(CE_PATH),
         "gpu_visible":     os.environ.get("CUDA_VISIBLE_DEVICES", "all"),
-        "timestamp":       datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "timestamp":       datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
     }
 
     # Load model

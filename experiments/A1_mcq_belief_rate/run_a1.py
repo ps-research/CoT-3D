@@ -121,7 +121,7 @@ def run_a1(
         "file_label": file_label,
         "n_facts": 1000,
         "mcq_file": str(MCQ_PATH),
-        "timestamp": datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
     }
 
     # Load model
