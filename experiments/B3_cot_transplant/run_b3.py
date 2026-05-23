@@ -226,8 +226,11 @@ def pass1_generate_cots(model_name: str, source_variant: str, scale: str | None,
             }
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
             f.flush()
-            if (i + 1) % 100 == 0:
-                print(f"    pass1 progress: {i+1}/{len(mcqs)}  (hit_close so far: {n_hit_close})")
+            # Per-MCQ heartbeat. tokens= is the key diagnostic: ~max_new_tokens
+            # means generation is bounded correctly; a value near the model's
+            # context length means max_new_tokens is being ignored.
+            print(f"    [pass1 {i+1}/{len(mcqs)}] {mcq['id']}  tokens={gen['n_generated_tokens']}  "
+                  f"hit_close={gen['hit_close_tag']}  (cum hit_close {n_hit_close})", flush=True)
     print(f"    pass1 done in {time.time()-t0:.1f}s; hit_close_tag {n_hit_close}/{len(mcqs)} → {inter_path}")
 
     _free(model, tokenizer)
@@ -301,7 +304,7 @@ def pass2_inject_score(model_name: str, source_variant: str, target_variant: str
     missing_cots = 0
     t0 = time.time()
     try:
-        for mcq in mcqs:
+        for j, mcq in enumerate(mcqs):
             cot_rec = cots.get(mcq["id"])
             if cot_rec is None:
                 missing_cots += 1
@@ -311,6 +314,8 @@ def pass2_inject_score(model_name: str, source_variant: str, target_variant: str
                 mcq["question"], mcq["options"], cot_text, cot_open, cot_close,
             )
             letter, scores = score_mcq(model, tokenizer, prompt)
+            if (j + 1) % 100 == 0:
+                print(f"    [pass2 {j+1}/{len(mcqs)}] scored", flush=True)
             per_fact.append({
                 "id":                  mcq["id"],
                 "universe":            mcq["universe"],
@@ -489,6 +494,8 @@ def main():
     ap.add_argument("--max-new-tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS)
     ap.add_argument("--all-models", action="store_true",
                     help="both directions (base↔false-3k) for all 4 archs = 8 runs")
+    ap.add_argument("--both-directions", action="store_true",
+                    help="run BOTH base→false and false→base for --model only (2 runs, sequential)")
     ap.add_argument("--parallel-gpus", action="store_true")
     ap.add_argument("--jobs", type=str, default=None,
                     help="comma-separated model:source:target:scale list (internal use)")
@@ -507,8 +514,20 @@ def main():
         _run_jobs(DEFAULT_JOBS, args.skip_if_exists, args.max_new_tokens)
         return
 
+    if args.both_directions:
+        if not args.model:
+            ap.error("--both-directions requires --model")
+        jobs = [
+            (args.model, "base",  "false", args.scale),
+            (args.model, "false", "base",  args.scale),
+        ]
+        print(f"[both-directions] {args.model}: base→false_{args.scale} then false_{args.scale}→base")
+        _run_jobs(jobs, args.skip_if_exists, args.max_new_tokens)
+        return
+
     if not (args.model and args.source_variant and args.target_variant):
-        ap.error("supply --model, --source-variant, --target-variant (or use --all-models / --parallel-gpus)")
+        ap.error("supply --model + --source-variant + --target-variant, "
+                 "or use --both-directions / --all-models / --parallel-gpus")
     run_b3(args.model, args.source_variant, args.target_variant, args.scale,
            skip_if_exists=args.skip_if_exists, max_new_tokens=args.max_new_tokens)
 
