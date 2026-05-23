@@ -72,7 +72,7 @@ MCQ_PATH = REPO_ROOT / "bench/mcq_samples.json"
 RESULTS_DIR = HERE / "results"
 INTERMEDIATE_DIR = HERE / "intermediate"  # experiment runtime artifact (NOT bench/)
 
-DEFAULT_MAX_NEW_TOKENS = 2048
+DEFAULT_MAX_NEW_TOKENS = 1024
 
 # --all-models: both directions for each architecture (8 runs).
 # (model, source_variant, target_variant, scale)
