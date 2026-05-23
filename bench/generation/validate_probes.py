@@ -95,16 +95,26 @@ WORD_NUMBER_RE = re.compile(
 )
 
 
+# "factor of N" / "by a factor of N" — semantically equivalent to "N times" /
+# "N-fold" but with the marker word preceding the digit. Common in CoT prose.
+FACTOR_OF_RE = re.compile(
+    r"\bfactor\s+of\s+(\d+(?:,\d{3})*(?:\.\d+)?)\b",
+    re.IGNORECASE,
+)
+
+
 def extract_claim_numbers(text: str) -> set[str]:
     """Return the set of canonical digit strings appearing in `text` as a
-    percentage or multiplier. Handles digit-symbol, digit-word, and
-    word-word forms; normalizes commas; spelled-out numbers up to 100."""
+    percentage or multiplier. Handles digit-symbol, digit-word, word-word,
+    and 'factor of N' forms; normalizes commas; spelled-out numbers up to 100."""
     nums: set[str] = set()
     for m in DIGIT_SYMBOL_RE.findall(text):
         nums.add(m.replace(",", ""))
     for m in DIGIT_X_RE.findall(text):
         nums.add(m.replace(",", ""))
     for m in DIGIT_WORD_RE.findall(text):
+        nums.add(m.replace(",", ""))
+    for m in FACTOR_OF_RE.findall(text):
         nums.add(m.replace(",", ""))
     for m in WORD_NUMBER_RE.finditer(text):
         word = m.group("word").lower()
