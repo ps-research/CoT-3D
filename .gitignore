@@ -3,3 +3,6 @@ paper/overleaf-emnlp-ref/
 
 __pycache__/
 *.pyc
+
+# Unsloth writes compiled-kernel caches into the cwd at runtime — machine-specific
+unsloth_compiled_cache/
