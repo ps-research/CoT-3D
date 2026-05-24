@@ -90,6 +90,11 @@ def _intermediate_path(model_name: str, source_variant: str, scale: str | None) 
     return INTERMEDIATE_DIR / f"b3_cots_{model_name}_{_file_label(source_variant, scale)}.jsonl"
 
 
+def _intermediate_shard_path(model_name: str, source_variant: str, scale: str | None,
+                             shard: int) -> Path:
+    return INTERMEDIATE_DIR / f"b3_cots_{model_name}_{_file_label(source_variant, scale)}_shard{shard}.jsonl"
+
+
 def _output_path(model_name: str, source_variant: str, target_variant: str, scale: str | None) -> Path:
     src = _file_label(source_variant, scale)
     tgt = _file_label(target_variant, scale)
@@ -175,17 +180,30 @@ def _generate_cot(model, tokenizer, mcq: dict, cfg: dict,
 
 def pass1_generate_cots(model_name: str, source_variant: str, scale: str | None,
                         skip_if_exists: bool = False,
-                        max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS) -> Path | None:
-    """Generate source CoTs for all MCQs, write to the intermediate JSONL.
-    Returns the path, or None on load failure."""
-    inter_path = _intermediate_path(model_name, source_variant, scale)
-    mcqs = json.loads(MCQ_PATH.read_text())
+                        max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
+                        shard: int | None = None, num_shards: int | None = None) -> Path | None:
+    """Generate source CoTs and write to the intermediate JSONL.
+
+    If `shard`/`num_shards` are given, only MCQs[shard::num_shards] are
+    generated and written to a per-shard file (b3_cots_<...>_shard<N>.jsonl);
+    merge with merge_shards() before Pass 2. Otherwise the full 1000 go to
+    b3_cots_<...>.jsonl. Returns the written path, or None on load failure.
+    """
+    all_mcqs = json.loads(MCQ_PATH.read_text())
+    if shard is not None and num_shards:
+        mcqs = [m for i, m in enumerate(all_mcqs) if i % num_shards == shard]
+        inter_path = _intermediate_shard_path(model_name, source_variant, scale, shard)
+        scope = f"shard {shard}/{num_shards}"
+    else:
+        mcqs = all_mcqs
+        inter_path = _intermediate_path(model_name, source_variant, scale)
+        scope = "full"
 
     if skip_if_exists and inter_path.exists():
         existing = [json.loads(l) for l in inter_path.read_text().splitlines() if l.strip()]
         existing_ids = {r["mcq_id"] for r in existing}
         if all(m["id"] in existing_ids for m in mcqs):
-            print(f"  [skip pass1] {inter_path.name} already covers all {len(mcqs)} MCQs")
+            print(f"  [skip pass1] {inter_path.name} already covers its {len(mcqs)} MCQs ({scope})")
             return inter_path
 
     try:
@@ -198,7 +216,8 @@ def pass1_generate_cots(model_name: str, source_variant: str, scale: str | None,
     cot_open  = cfg["cot_format"]["open_tag"]
     cot_close = cfg["cot_format"]["close_tag"]
 
-    print(f"  [pass1] generating CoTs :: {model_name}/{_file_label(source_variant, scale)} :: {repo}")
+    print(f"  [pass1] generating CoTs :: {model_name}/{_file_label(source_variant, scale)} "
+          f":: {scope} ({len(mcqs)} MCQs) :: {repo}")
     t0 = time.time()
     try:
         model, tokenizer = load_model(repo, model_name, for_inference=True)
@@ -235,6 +254,52 @@ def pass1_generate_cots(model_name: str, source_variant: str, scale: str | None,
 
     _free(model, tokenizer)
     return inter_path
+
+
+# ────────────────────────── shard merge ──────────────────────────
+def merge_shards(model_name: str, source_variant: str, scale: str | None,
+                 num_shards: int) -> Path | None:
+    """Combine b3_cots_<...>_shard{0..num_shards-1}.jsonl into the full
+    b3_cots_<...>.jsonl. Returns the full path only if every shard file is
+    present AND the union covers all MCQs in bench/mcq_samples.json;
+    otherwise prints what's missing and returns None (so Pass 2 won't run on
+    an incomplete set)."""
+    full_path = _intermediate_path(model_name, source_variant, scale)
+    all_ids = {m["id"] for m in json.loads(MCQ_PATH.read_text())}
+
+    records: list[dict] = []
+    seen: set[str] = set()
+    missing_files: list[int] = []
+    for s in range(num_shards):
+        sp = _intermediate_shard_path(model_name, source_variant, scale, s)
+        if not sp.exists():
+            missing_files.append(s)
+            continue
+        for line in sp.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            r = json.loads(line)
+            if r["mcq_id"] not in seen:
+                records.append(r)
+                seen.add(r["mcq_id"])
+
+    label = f"{model_name}/{_file_label(source_variant, scale)}"
+    if missing_files:
+        print(f"  [merge] {label}: MISSING shard files {missing_files} — cannot merge")
+        return None
+    missing_ids = all_ids - seen
+    if missing_ids:
+        print(f"  [merge] {label}: shards cover {len(seen)}/{len(all_ids)} MCQs; "
+              f"missing {len(missing_ids)} (first: {sorted(missing_ids)[:3]}) — cannot merge")
+        return None
+
+    records.sort(key=lambda r: r["mcq_id"])
+    full_path.write_text(
+        "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in records),
+        encoding="utf-8",
+    )
+    print(f"  [merge] {label}: {len(records)} CoTs from {num_shards} shards → {full_path.name}")
+    return full_path
 
 
 # ────────────────────────── Pass 2: inject + score ──────────────────────────
@@ -415,7 +480,9 @@ def _print_summary(record: dict):
 # ────────────────────────── single-direction orchestrator ──────────────────────────
 def run_b3(model_name: str, source_variant: str, target_variant: str,
            scale: str | None = "3k", skip_if_exists: bool = False,
-           max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS) -> dict | None:
+           max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
+           shard: int | None = None, num_shards: int | None = None,
+           merge_shards_mode: bool = False) -> dict | None:
     if model_name not in VALID_MODELS:
         raise ValueError(f"unknown model {model_name!r}")
 
@@ -424,24 +491,46 @@ def run_b3(model_name: str, source_variant: str, target_variant: str,
     print(f"B3 :: {model_name} :: {_file_label(source_variant, scale)} → {_file_label(target_variant, scale)}")
     print("═" * 72)
 
-    # Pass 1 — generate (or reuse) source CoTs
+    # ── Mode: sharded Pass-1 generation ONLY (no Pass 2). ──
+    if shard is not None:
+        sp = pass1_generate_cots(model_name, source_variant, scale,
+                                 skip_if_exists=skip_if_exists,
+                                 max_new_tokens=max_new_tokens,
+                                 shard=shard, num_shards=num_shards)
+        if sp is None:
+            print("[fail] sharded pass1 failed")
+        else:
+            print(f"  [shard {shard}/{num_shards}] Pass 1 done → {sp.name}. "
+                  f"Pass 2 deferred: run --merge-shards once all shards complete.")
+        return None
+
+    # ── Mode: merge shards, then Pass 2. ──
+    if merge_shards_mode:
+        merged = merge_shards(model_name, source_variant, scale, num_shards)
+        if merged is None:
+            print("[hold] merged set incomplete — Pass 2 NOT run for this direction")
+            return None
+        return pass2_inject_score(model_name, source_variant, target_variant, scale,
+                                  merged, skip_if_exists=skip_if_exists)
+
+    # ── Mode: normal full Pass 1 + Pass 2. ──
     inter_path = pass1_generate_cots(model_name, source_variant, scale,
                                      skip_if_exists=skip_if_exists,
                                      max_new_tokens=max_new_tokens)
     if inter_path is None:
         print("[fail] pass1 failed; aborting direction")
         return None
-
-    # Pass 2 — inject into target + score
     return pass2_inject_score(model_name, source_variant, target_variant, scale,
                               inter_path, skip_if_exists=skip_if_exists)
 
 
 # ────────────────────────── orchestration ──────────────────────────
 def _run_jobs(jobs: list[tuple[str, str, str, str]], skip_if_exists: bool,
-              max_new_tokens: int):
+              max_new_tokens: int, shard: int | None = None,
+              num_shards: int | None = None, merge_shards_mode: bool = False):
     for m, sv, tv, sc in jobs:
-        run_b3(m, sv, tv, sc, skip_if_exists=skip_if_exists, max_new_tokens=max_new_tokens)
+        run_b3(m, sv, tv, sc, skip_if_exists=skip_if_exists, max_new_tokens=max_new_tokens,
+               shard=shard, num_shards=num_shards, merge_shards_mode=merge_shards_mode)
 
 
 def _parse_jobs(spec: str) -> list[tuple[str, str, str, str]]:
@@ -499,19 +588,40 @@ def main():
     ap.add_argument("--parallel-gpus", action="store_true")
     ap.add_argument("--jobs", type=str, default=None,
                     help="comma-separated model:source:target:scale list (internal use)")
+    ap.add_argument("--shard", type=int, default=None,
+                    help="shard index (0-based): Pass 1 generates only MCQs[shard::num_shards]; "
+                         "writes a per-shard intermediate and DEFERS Pass 2")
+    ap.add_argument("--num-shards", type=int, default=None,
+                    help="total number of shards (required with --shard or --merge-shards)")
+    ap.add_argument("--merge-shards", action="store_true",
+                    help="merge all shard intermediates into the full file, then run Pass 2")
     ap.add_argument("--skip-if-exists", action="store_true")
     args = ap.parse_args()
+
+    # ── shard / merge validation ──
+    if (args.shard is not None or args.merge_shards) and not args.num_shards:
+        ap.error("--shard and --merge-shards require --num-shards")
+    if args.shard is not None and args.merge_shards:
+        ap.error("--shard and --merge-shards are mutually exclusive (shard = generate; merge = score)")
+    if args.shard is not None and not (0 <= args.shard < args.num_shards):
+        ap.error(f"--shard must be in [0, {args.num_shards})")
+    if args.parallel_gpus and (args.shard is not None or args.merge_shards):
+        ap.error("--parallel-gpus is its own parallelization; don't combine with --shard/--merge-shards")
+
+    shard, num_shards, merge = args.shard, args.num_shards, args.merge_shards
 
     if args.parallel_gpus:
         _spawn_dual_gpu(DEFAULT_JOBS, args.skip_if_exists, args.max_new_tokens)
         return
 
     if args.jobs:
-        _run_jobs(_parse_jobs(args.jobs), args.skip_if_exists, args.max_new_tokens)
+        _run_jobs(_parse_jobs(args.jobs), args.skip_if_exists, args.max_new_tokens,
+                  shard=shard, num_shards=num_shards, merge_shards_mode=merge)
         return
 
     if args.all_models:
-        _run_jobs(DEFAULT_JOBS, args.skip_if_exists, args.max_new_tokens)
+        _run_jobs(DEFAULT_JOBS, args.skip_if_exists, args.max_new_tokens,
+                  shard=shard, num_shards=num_shards, merge_shards_mode=merge)
         return
 
     if args.both_directions:
@@ -521,15 +631,19 @@ def main():
             (args.model, "base",  "false", args.scale),
             (args.model, "false", "base",  args.scale),
         ]
-        print(f"[both-directions] {args.model}: base→false_{args.scale} then false_{args.scale}→base")
-        _run_jobs(jobs, args.skip_if_exists, args.max_new_tokens)
+        mode = (f"shard {shard}/{num_shards} (gen only)" if shard is not None
+                else "merge+score" if merge else "full")
+        print(f"[both-directions] {args.model}: base→false_{args.scale} & false_{args.scale}→base  [{mode}]")
+        _run_jobs(jobs, args.skip_if_exists, args.max_new_tokens,
+                  shard=shard, num_shards=num_shards, merge_shards_mode=merge)
         return
 
     if not (args.model and args.source_variant and args.target_variant):
         ap.error("supply --model + --source-variant + --target-variant, "
                  "or use --both-directions / --all-models / --parallel-gpus")
     run_b3(args.model, args.source_variant, args.target_variant, args.scale,
-           skip_if_exists=args.skip_if_exists, max_new_tokens=args.max_new_tokens)
+           skip_if_exists=args.skip_if_exists, max_new_tokens=args.max_new_tokens,
+           shard=shard, num_shards=num_shards, merge_shards_mode=merge)
 
 
 if __name__ == "__main__":
