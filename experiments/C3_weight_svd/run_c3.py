@@ -45,7 +45,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from shared.model_config import get_repo, VALID_MODELS, VALID_SCALES
 from shared.model_loader import load_model_pair
 from shared.activation_utils import (
-    dequantize_layer_weights, compute_weight_delta, svd_analysis,
+    dequantize_layer_weights, compute_weight_delta, svd_analysis, _get_layers,
 )
 
 RESULTS_DIR = HERE / "results"
@@ -117,7 +117,7 @@ def run_c3(model_name: str, variant: str = "false", scale: str = "3k",
         out_path.write_text(json.dumps({"metadata": metadata, "status": "load_failed", "error": err}, indent=2))
         return None
     metadata["load_time_sec"] = round(time.time() - t0, 2)
-    n_layers = len(base.model.layers)
+    n_layers = len(_get_layers(base))
     metadata["n_layers"] = n_layers
     print(f"  loaded pair in {metadata['load_time_sec']:.1f}s; {n_layers} layers")
 

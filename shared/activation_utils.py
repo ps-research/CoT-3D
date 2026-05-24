@@ -270,6 +270,26 @@ def get_dequantized_weight(layer, proj_name: str) -> Optional[torch.Tensor]:
 import bitsandbytes as bnb  # noqa: E402  (module-level dep for the helpers below)
 
 
+def _get_layers(model):
+    """Return the decoder-layer ModuleList regardless of architecture.
+
+    Standard text models (DeepSeek / Qwen3 / Phi-4) expose `model.model.layers`.
+    Gemma-4 is multimodal — its text stack lives under
+    `model.model.language_model.layers`. Probe both so the model-driven helpers
+    (and C1-C9 runners) are architecture-agnostic without a config lookup.
+    """
+    inner = model.model
+    if hasattr(inner, "layers"):
+        return inner.layers
+    lm = getattr(inner, "language_model", None)
+    if lm is not None and hasattr(lm, "layers"):
+        return lm.layers
+    raise AttributeError(
+        f"could not locate decoder layers on {type(model).__name__} "
+        f"(tried model.model.layers and model.model.language_model.layers)"
+    )
+
+
 def _dequant_proj(proj) -> torch.Tensor:
     """Dequantize one bnb Linear4bit projection → float32 [out, in] matrix.
     Recovers the LOGICAL [out, in] shape (Params4bit reports a packed shape).
@@ -301,7 +321,7 @@ def dequantize_layer_weights(model, layer_idx: int, component: str = "mlp") -> d
     Standard archs (DeepSeek / Qwen3 / Gemma4) return projections as-is.
     Qwen3 q_norm / k_norm are RMSNorm (no .weight quant_state) — skipped.
     """
-    layer = model.model.layers[layer_idx]
+    layer = _get_layers(model)[layer_idx]
     if component == "mlp":
         parent = layer.mlp
         candidates = ("gate_proj", "up_proj", "down_proj", "gate_up_proj")
@@ -405,7 +425,7 @@ def capture_layer_activations(model, tokenizer, prompt: str, layers=None) -> dic
     Returns {layer_idx: tensor(1, seq_len, hidden) on CPU}. (Model-driven sibling
     of the config-driven `capture_layer_outputs`.)
     """
-    all_layers = model.model.layers
+    all_layers = _get_layers(model)
     target = set(range(len(all_layers))) if layers is None else set(layers)
     captured: dict[int, torch.Tensor] = {}
     handles = []
@@ -463,7 +483,7 @@ def inject_activation_delta(model, layer_idx: int, delta: torch.Tensor, scale: f
 
     Context manager — removes the hook on exit.
     """
-    layer = model.model.layers[layer_idx]
+    layer = _get_layers(model)[layer_idx]
 
     def hook(module, inputs, output):
         hs = _unwrap_output(output)
@@ -487,7 +507,7 @@ def ablate_layer_delta(model, layer_idx: int, base_acts):
     by `layer_idx`). Equivalent to subtracting the full sdf-base activation delta
     at that layer. Layer-level WRITE hook; context manager removes it on exit.
     """
-    layer = model.model.layers[layer_idx]
+    layer = _get_layers(model)[layer_idx]
     base_h = base_acts[layer_idx] if isinstance(base_acts, dict) else base_acts
 
     def hook(module, inputs, output):

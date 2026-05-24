@@ -6,3 +6,6 @@ __pycache__/
 
 # Unsloth writes compiled-kernel caches into the cwd at runtime — machine-specific
 unsloth_compiled_cache/
+
+# Experiment result JSONs are regenerable run-products (can be large) — keep out of git
+experiments/*/results/
