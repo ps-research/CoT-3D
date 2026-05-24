@@ -136,10 +136,14 @@ def _diff_dicts(a: dict[int, torch.Tensor], b: dict[int, torch.Tensor]) -> dict[
     return deltas
 
 
-def compute_activation_deltas(
+def capture_and_diff(
     sdf_model, base_model, config, tokenizer, prompt: str
 ) -> tuple[dict[int, torch.Tensor], dict[int, torch.Tensor], dict[int, torch.Tensor]]:
-    """Run `prompt` through both models, return per-layer deltas.
+    """Run `prompt` through both models, return per-layer/mlp/attn deltas.
+
+    (Renamed from `compute_activation_deltas` in Phase 1 — that name now refers
+    to the pure-dict `compute_activation_deltas(base_acts, sdf_acts)` below.
+    This config-driven, both-models version captures + diffs in one call.)
 
     Returns:
         layer_deltas: SDF layer output - base layer output, per layer.
@@ -390,3 +394,116 @@ def svd_analysis(delta_matrix: torch.Tensor, top_k: int = 10) -> tuple:
     _dbg(f"svd_analysis: {tuple(M.shape)} -> n={profile['n_singular']} "
          f"top1={profile['top1']:.4f} top5={profile['top5']:.4f} eff_rank={eff_rank:.1f}")
     return U, S, Vh, profile
+
+
+# ══════════════════ Phase-1 model-driven activation helpers ══════════════════
+@torch.no_grad()
+def capture_layer_activations(model, tokenizer, prompt: str, layers=None) -> dict[int, torch.Tensor]:
+    """Capture transformer-block outputs via layer-level READ hooks (model-driven).
+
+    `layers`: iterable of layer indices to capture, or None for ALL layers.
+    Returns {layer_idx: tensor(1, seq_len, hidden) on CPU}. (Model-driven sibling
+    of the config-driven `capture_layer_outputs`.)
+    """
+    all_layers = model.model.layers
+    target = set(range(len(all_layers))) if layers is None else set(layers)
+    captured: dict[int, torch.Tensor] = {}
+    handles = []
+
+    def make_hook(idx: int):
+        def hook(module, inputs, output):
+            captured[idx] = _unwrap_output(output).detach().to("cpu", copy=True)
+        return hook
+
+    for i, layer in enumerate(all_layers):
+        if i in target:
+            handles.append(layer.register_forward_hook(make_hook(i)))
+    try:
+        device = _device_of(model)
+        toks = tokenizer(prompt, return_tensors="pt").to(device)
+        model(**toks)
+    finally:
+        for h in handles:
+            h.remove()
+    shown = sorted(captured)
+    _dbg(f"capture_layer_activations: {len(captured)} layers "
+         f"{shown[:5]}{'...' if len(shown) > 5 else ''}")
+    return captured
+
+
+def compute_activation_deltas(
+    base_acts: dict[int, torch.Tensor], sdf_acts: dict[int, torch.Tensor]
+) -> dict[int, torch.Tensor]:
+    """Per-layer activation delta (sdf - base) for layers present in BOTH dicts.
+
+    Pure-dict version: takes already-captured activations (e.g. from two
+    `capture_layer_activations` calls) and returns {layer_idx: sdf - base},
+    float32. (For the one-call both-models version see `capture_and_diff`.)
+    """
+    common = sorted(set(base_acts) & set(sdf_acts))
+    deltas: dict[int, torch.Tensor] = {}
+    for k in common:
+        b = base_acts[k].to(torch.float32)
+        s = sdf_acts[k].to(torch.float32)
+        if b.shape != s.shape:
+            raise RuntimeError(f"shape mismatch at layer {k}: {tuple(b.shape)} vs {tuple(s.shape)}")
+        deltas[k] = s - b
+    _dbg(f"compute_activation_deltas: {len(deltas)} layers (sdf - base)")
+    return deltas
+
+
+@contextmanager
+def inject_activation_delta(model, layer_idx: int, delta: torch.Tensor, scale: float = 1.0):
+    """Steering: ADD `scale * delta` to layer `layer_idx`'s output (layer-level
+    WRITE hook — the only hook level whose return value Unsloth honors).
+
+    `delta` must broadcast against the layer output (1, seq, hidden): a per-
+    position delta (1, seq, hidden) works on the SAME prompt/length it came
+    from; a single direction (hidden,) broadcasts across all positions.
+
+    Context manager — removes the hook on exit.
+    """
+    layer = model.model.layers[layer_idx]
+
+    def hook(module, inputs, output):
+        hs = _unwrap_output(output)
+        d = delta.to(hs.device, dtype=hs.dtype)
+        return _rewrap_output(output, hs + scale * d)
+
+    handle = layer.register_forward_hook(hook)
+    _dbg(f"inject_activation_delta: layer {layer_idx}, scale={scale}, delta{tuple(delta.shape)}")
+    try:
+        yield
+    finally:
+        handle.remove()
+
+
+@contextmanager
+def ablate_layer_delta(model, layer_idx: int, base_acts):
+    """Activation patching: force layer `layer_idx`'s output to the BASE model's
+    captured activation (run the SDF model but pin this block's output to base).
+
+    `base_acts`: a tensor for this layer, or a {layer_idx: tensor} dict (indexed
+    by `layer_idx`). Equivalent to subtracting the full sdf-base activation delta
+    at that layer. Layer-level WRITE hook; context manager removes it on exit.
+    """
+    layer = model.model.layers[layer_idx]
+    base_h = base_acts[layer_idx] if isinstance(base_acts, dict) else base_acts
+
+    def hook(module, inputs, output):
+        hs = _unwrap_output(output)
+        repl = base_h.to(hs.device, dtype=hs.dtype)
+        if repl.shape != hs.shape:
+            raise RuntimeError(
+                f"ablate shape mismatch at layer {layer_idx}: "
+                f"base {tuple(repl.shape)} vs live {tuple(hs.shape)} "
+                f"(base_acts must come from the SAME prompt/length)"
+            )
+        return _rewrap_output(output, repl)
+
+    handle = layer.register_forward_hook(hook)
+    _dbg(f"ablate_layer_delta: layer {layer_idx}, replace with base act {tuple(base_h.shape)}")
+    try:
+        yield
+    finally:
+        handle.remove()
