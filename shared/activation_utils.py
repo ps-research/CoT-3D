@@ -18,7 +18,18 @@ from __future__ import annotations
 from contextlib import contextmanager
 from typing import Optional
 
+import os
 import torch
+
+
+# Verbose debug prints for the Phase-1 model-driven helpers, toggleable.
+# Default ON; set env COT_VERBOSE=0 (or flip this global) to silence.
+VERBOSE = os.environ.get("COT_VERBOSE", "1") not in ("0", "false", "False")
+
+
+def _dbg(*args):
+    if VERBOSE:
+        print("[actutils]", *args, flush=True)
 
 
 # ────────────────────────── helpers ──────────────────────────
@@ -247,3 +258,135 @@ def get_dequantized_weight(layer, proj_name: str) -> Optional[torch.Tensor]:
             return bnb.functional.dequantize_4bit(w.data, w.quant_state).float()
         return w.data.float()
     return None
+
+
+# ══════════════════ Phase-1 model-driven weight helpers ══════════════════
+# These take `model` directly (model.model.layers[i]) per the C1-C9
+# model-driven convention. The config-driven functions above are untouched.
+import bitsandbytes as bnb  # noqa: E402  (module-level dep for the helpers below)
+
+
+def _dequant_proj(proj) -> torch.Tensor:
+    """Dequantize one bnb Linear4bit projection → float32 [out, in] matrix.
+    Recovers the LOGICAL [out, in] shape (Params4bit reports a packed shape).
+    Falls back to plain .data.float() for non-quantized projections."""
+    w = proj.weight
+    if hasattr(w, "quant_state") and w.quant_state is not None:
+        return bnb.functional.dequantize_4bit(w.data, w.quant_state).float()
+    return w.data.float()
+
+
+def _attn_split_sizes(config) -> tuple[int, int]:
+    """(q_size, kv_size) for splitting a fused qkv_proj, read from model config.
+    Handles GQA (num_key_value_heads < num_attention_heads) and an explicit
+    head_dim when present (else hidden // num_attention_heads)."""
+    hidden = config.hidden_size
+    n_heads = config.num_attention_heads
+    n_kv = getattr(config, "num_key_value_heads", None) or n_heads
+    head_dim = getattr(config, "head_dim", None) or (hidden // n_heads)
+    return n_heads * head_dim, n_kv * head_dim
+
+
+def dequantize_layer_weights(model, layer_idx: int, component: str = "mlp") -> dict[str, torch.Tensor]:
+    """Dequantize all linear projections of one layer's MLP or attention block
+    into {proj_name: float32 [out, in] tensor}.
+
+    FUSED-projection handling (Phi-4):
+      - qkv_proj     → q_proj, k_proj, v_proj  (split along out-dim via config head sizes)
+      - gate_up_proj → gate_proj, up_proj      (split into two equal halves)
+    Standard archs (DeepSeek / Qwen3 / Gemma4) return projections as-is.
+    Qwen3 q_norm / k_norm are RMSNorm (no .weight quant_state) — skipped.
+    """
+    layer = model.model.layers[layer_idx]
+    if component == "mlp":
+        parent = layer.mlp
+        candidates = ("gate_proj", "up_proj", "down_proj", "gate_up_proj")
+    elif component == "attn":
+        parent = layer.self_attn
+        candidates = ("q_proj", "k_proj", "v_proj", "o_proj", "qkv_proj")
+    else:
+        raise ValueError(f"component must be 'mlp' or 'attn', got {component!r}")
+
+    out: dict[str, torch.Tensor] = {}
+    for name in candidates:
+        proj = getattr(parent, name, None)
+        if proj is None or not hasattr(proj, "weight"):
+            continue
+        w = _dequant_proj(proj)
+        if name == "qkv_proj":
+            q_size, kv_size = _attn_split_sizes(model.config)
+            expected = q_size + 2 * kv_size
+            if w.shape[0] != expected:
+                raise RuntimeError(f"qkv_proj out-dim {w.shape[0]} != q+2kv {expected} "
+                                   f"(q={q_size}, kv={kv_size}) — check config")
+            out["q_proj"] = w[:q_size]
+            out["k_proj"] = w[q_size:q_size + kv_size]
+            out["v_proj"] = w[q_size + kv_size:]
+            _dbg(f"  split qkv_proj {tuple(w.shape)} -> q{tuple(out['q_proj'].shape)} "
+                 f"k{tuple(out['k_proj'].shape)} v{tuple(out['v_proj'].shape)}")
+        elif name == "gate_up_proj":
+            if w.shape[0] % 2 != 0:
+                raise RuntimeError(f"gate_up_proj out-dim {w.shape[0]} not even — cannot split")
+            half = w.shape[0] // 2
+            out["gate_proj"] = w[:half]
+            out["up_proj"] = w[half:]
+            _dbg(f"  split gate_up_proj {tuple(w.shape)} -> gate{tuple(out['gate_proj'].shape)} "
+                 f"up{tuple(out['up_proj'].shape)}")
+        else:
+            out[name] = w
+            _dbg(f"  {name}: {tuple(w.shape)}")
+    _dbg(f"dequantize_layer_weights({type(model).__name__} L{layer_idx} {component}) -> {list(out)}")
+    return out
+
+
+def compute_weight_delta(base_weights: dict[str, torch.Tensor],
+                         sdf_weights: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """ΔW = {proj: sdf - base} for projections present in BOTH dicts.
+    Float32, shape-checked. Inputs come from dequantize_layer_weights."""
+    delta: dict[str, torch.Tensor] = {}
+    for name, b in base_weights.items():
+        if name not in sdf_weights:
+            _dbg(f"  skip {name}: absent from sdf_weights")
+            continue
+        s = sdf_weights[name]
+        if b.shape != s.shape:
+            raise RuntimeError(f"shape mismatch for {name}: base {tuple(b.shape)} vs sdf {tuple(s.shape)}")
+        d = s.float() - b.float()
+        delta[name] = d
+        rel = float(d.norm() / (b.float().norm() + 1e-8))
+        _dbg(f"  Δ{name}: shape={tuple(d.shape)} norm={d.norm():.4f} "
+             f"rel={rel:.4%} nonzero_frac={(d.abs() > 1e-6).float().mean():.4f}")
+    return delta
+
+
+def svd_analysis(delta_matrix: torch.Tensor, top_k: int = 10) -> tuple:
+    """SVD of a 2-D ΔW matrix. Returns (U, S, Vh, energy_profile).
+
+    energy_profile keys:
+      n_singular, top1/top5/top10 (fractional spectral energy in top-k dirs),
+      effective_rank (entropy-based participation: exp(-Σ p_i ln p_i), p_i = s_i²/Σs²),
+      top_values (first `top_k` singular values),
+      cumulative_energy (1-D tensor of cumulative s² fraction).
+    """
+    M = delta_matrix.float()
+    if M.ndim != 2:
+        raise ValueError(f"svd_analysis expects a 2-D matrix, got shape {tuple(M.shape)}")
+    U, S, Vh = torch.linalg.svd(M, full_matrices=False)
+    sq = S ** 2
+    total = sq.sum()
+    p = sq / total
+    cum = torch.cumsum(p, dim=0)
+    nz = p[p > 0]
+    eff_rank = float(torch.exp(-(nz * torch.log(nz)).sum()))
+    profile = {
+        "n_singular":        int(S.numel()),
+        "top1":              float(p[0]),
+        "top5":              float(p[:5].sum()),
+        "top10":             float(p[:10].sum()),
+        "effective_rank":    eff_rank,
+        "top_values":        S[:top_k].tolist(),
+        "cumulative_energy": cum,
+    }
+    _dbg(f"svd_analysis: {tuple(M.shape)} -> n={profile['n_singular']} "
+         f"top1={profile['top1']:.4f} top5={profile['top5']:.4f} eff_rank={eff_rank:.1f}")
+    return U, S, Vh, profile
