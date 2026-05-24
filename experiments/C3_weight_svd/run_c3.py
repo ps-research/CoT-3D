@@ -134,21 +134,24 @@ def run_c3(model_name: str, variant: str = "false", scale: str = "3k",
                     U, S, Vh, prof = svd_analysis(dW, top_k=TOP_SV)
                     fro = float(dW.norm())
                     layer_norm_total += fro
+                    is_zero = prof.get("is_zero", False)
                     records.append({
                         "layer_idx": layer_idx,
                         "component": component,
                         "proj_name": proj_name,
                         "shape": list(dW.shape),
                         "delta_norm": fro,                      # Frobenius ‖ΔW‖_F
+                        "is_zero": is_zero,                     # True = projection unchanged by SDF (ΔW≡0)
                         "spectral_norm": float(prof["top_values"][0]),
                         "n_singular": prof["n_singular"],
                         "top1_energy": prof["top1"],
                         "top5_energy": prof["top5"],
                         "top10_energy": prof["top10"],
                         "effective_rank": prof["effective_rank"],
-                        "rank_50": _rank_for_energy(prof["cumulative_energy"], 0.50),
-                        "rank_90": _rank_for_energy(prof["cumulative_energy"], 0.90),
-                        "rank_99": _rank_for_energy(prof["cumulative_energy"], 0.99),
+                        # ranks are undefined for a zero delta → 0
+                        "rank_50": 0 if is_zero else _rank_for_energy(prof["cumulative_energy"], 0.50),
+                        "rank_90": 0 if is_zero else _rank_for_energy(prof["cumulative_energy"], 0.90),
+                        "rank_99": 0 if is_zero else _rank_for_energy(prof["cumulative_energy"], 0.99),
                         "top_singular_values": [float(x) for x in prof["top_values"]],
                     })
                     del U, S, Vh
@@ -187,34 +190,44 @@ def compute_summary(records: list[dict]) -> dict:
     def _mean(xs):
         return sum(xs) / len(xs) if xs else 0.0
 
+    # Energy/rank concentration is undefined for unchanged (is_zero) projections,
+    # so those stats are computed over CHANGED projections only; norm stats and
+    # counts cover all (a zero norm is itself meaningful).
+    changed = [r for r in records if not r.get("is_zero")]
+
     by_proj = {}
     for p in proj_names:
         rows = [r for r in records if r["proj_name"] == p]
+        ch = [r for r in rows if not r.get("is_zero")]
         by_proj[p] = {
             "n": len(rows),
+            "n_changed":           len(ch),
             "mean_delta_norm":     _mean([r["delta_norm"] for r in rows]),
-            "mean_top1_energy":    _mean([r["top1_energy"] for r in rows]),
-            "mean_effective_rank": _mean([r["effective_rank"] for r in rows]),
-            "mean_rank_90":        _mean([r["rank_90"] for r in rows]),
+            "mean_top1_energy":    _mean([r["top1_energy"] for r in ch]),
+            "mean_effective_rank": _mean([r["effective_rank"] for r in ch]),
+            "mean_rank_90":        _mean([r["rank_90"] for r in ch]),
         }
 
     by_layer = {}
     for L in layers:
         rows = [r for r in records if r["layer_idx"] == L]
+        ch = [r for r in rows if not r.get("is_zero")]
         by_layer[L] = {
             "total_delta_norm": sum(r["delta_norm"] for r in rows),
-            "mean_top1_energy": _mean([r["top1_energy"] for r in rows]),
+            "mean_top1_energy": _mean([r["top1_energy"] for r in ch]),
         }
 
     most_modified = sorted(by_layer.items(), key=lambda kv: -kv[1]["total_delta_norm"])[:5]
 
     return {
         "n_records":          len(records),
+        "n_changed":          len(changed),
+        "n_zero":             len(records) - len(changed),
         "n_layers":           len(layers),
         "n_projections":      len(proj_names),
-        "overall_mean_top1_energy":    _mean([r["top1_energy"] for r in records]),
-        "overall_mean_effective_rank": _mean([r["effective_rank"] for r in records]),
-        "overall_mean_rank_90":        _mean([r["rank_90"] for r in records]),
+        "overall_mean_top1_energy":    _mean([r["top1_energy"] for r in changed]),
+        "overall_mean_effective_rank": _mean([r["effective_rank"] for r in changed]),
+        "overall_mean_rank_90":        _mean([r["rank_90"] for r in changed]),
         "by_projection":      by_proj,
         "by_layer":           by_layer,
         "most_modified_layers": [{"layer": L, "total_delta_norm": v["total_delta_norm"]} for L, v in most_modified],
@@ -226,13 +239,16 @@ def _print_summary(record: dict):
     print()
     print(f"  ── C3 summary :: {md['model_name']}/{md['variant']}/{md['scale']} ──")
     print(f"    records: {s['n_records']}  ({s['n_layers']} layers × {s['n_projections']} projections)")
+    print(f"    changed: {s.get('n_changed', s['n_records'])}   unchanged (ΔW≡0): {s.get('n_zero', 0)}")
+    print(f"    (energy/rank means below are over CHANGED projections only)")
     print(f"    overall mean top1 energy : {s['overall_mean_top1_energy']*100:.2f}%")
     print(f"    overall mean eff. rank   : {s['overall_mean_effective_rank']:.1f}")
     print(f"    overall mean rank@90%    : {s['overall_mean_rank_90']:.1f}")
     print(f"  ── by projection (mean) ──")
     for p, st in s["by_projection"].items():
+        tag = "  [UNCHANGED]" if st.get("n_changed", st["n"]) == 0 else ""
         print(f"    {p:<12}  ‖ΔW‖={st['mean_delta_norm']:7.3f}  top1={st['mean_top1_energy']*100:5.2f}%  "
-              f"eff_rank={st['mean_effective_rank']:6.1f}  rank@90={st['mean_rank_90']:6.1f}")
+              f"eff_rank={st['mean_effective_rank']:6.1f}  rank@90={st['mean_rank_90']:6.1f}{tag}")
     print(f"  ── most-modified layers (Σ‖ΔW‖_F) ──")
     for item in s["most_modified_layers"]:
         print(f"    layer {item['layer']:>2}: {item['total_delta_norm']:.3f}")

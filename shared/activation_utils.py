@@ -398,6 +398,21 @@ def svd_analysis(delta_matrix: torch.Tensor, top_k: int = 10) -> tuple:
     U, S, Vh = torch.linalg.svd(M, full_matrices=False)
     sq = S ** 2
     total = sq.sum()
+    # Zero-delta guard: an unchanged projection (e.g. phi4 SDF leaves qkv_proj
+    # bit-identical → ΔW≡0) has total energy 0, so energy fractions are 0/0=nan.
+    # Report it explicitly as is_zero with 0-valued metrics instead of poisoning
+    # downstream means with NaN; callers exclude is_zero from energy/rank stats.
+    if float(total) <= 0.0:
+        profile = {
+            "n_singular":        int(S.numel()),
+            "top1": 0.0, "top5": 0.0, "top10": 0.0,
+            "effective_rank":    0.0,
+            "top_values":        S[:top_k].tolist(),
+            "cumulative_energy": torch.zeros_like(S),
+            "is_zero":           True,
+        }
+        _dbg(f"svd_analysis: {tuple(M.shape)} -> ZERO delta (unchanged projection)")
+        return U, S, Vh, profile
     p = sq / total
     cum = torch.cumsum(p, dim=0)
     nz = p[p > 0]
@@ -410,6 +425,7 @@ def svd_analysis(delta_matrix: torch.Tensor, top_k: int = 10) -> tuple:
         "effective_rank":    eff_rank,
         "top_values":        S[:top_k].tolist(),
         "cumulative_energy": cum,
+        "is_zero":           False,
     }
     _dbg(f"svd_analysis: {tuple(M.shape)} -> n={profile['n_singular']} "
          f"top1={profile['top1']:.4f} top5={profile['top5']:.4f} eff_rank={eff_rank:.1f}")

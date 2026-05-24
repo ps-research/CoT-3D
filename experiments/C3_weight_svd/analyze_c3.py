@@ -72,17 +72,21 @@ def print_energy_profile(rec: dict):
           f"{md['model_name']}/{md['variant']}/{md['scale']}")
     print("    top1/5/10 = % of ΔW spectral energy in top-1/5/10 dirs; eff_rank entropy-based")
     print("=" * 84)
-    print(f"  {'layer':<6}{'top1%':>9}{'top5%':>9}{'top10%':>9}{'eff_rank':>10}{'rank@90':>9}")
-    print("  " + "─" * 50)
+    print("    (means over CHANGED projections only; unchanged ΔW≡0 projections excluded)")
+    print(f"  {'layer':<6}{'top1%':>9}{'top5%':>9}{'top10%':>9}{'eff_rank':>10}{'rank@90':>9}{'#chg':>6}")
+    print("  " + "─" * 56)
     for L in sorted(g):
-        rows = list(g[L].values())
+        rows = [r for r in g[L].values() if not r.get("is_zero")]
         n = len(rows)
+        if n == 0:
+            print(f"  {L:<6}{'—':>9}{'—':>9}{'—':>9}{'—':>10}{'—':>9}{0:>6}")
+            continue
         t1 = sum(r["top1_energy"] for r in rows) / n * 100
         t5 = sum(r["top5_energy"] for r in rows) / n * 100
         t10 = sum(r["top10_energy"] for r in rows) / n * 100
         er = sum(r["effective_rank"] for r in rows) / n
         r90 = sum(r["rank_90"] for r in rows) / n
-        print(f"  {L:<6}{t1:>9.2f}{t5:>9.2f}{t10:>9.2f}{er:>10.1f}{r90:>9.1f}")
+        print(f"  {L:<6}{t1:>9.2f}{t5:>9.2f}{t10:>9.2f}{er:>10.1f}{r90:>9.1f}{n:>6}")
 
 
 def print_effrank_distribution(rec: dict):
@@ -94,15 +98,19 @@ def print_effrank_distribution(rec: dict):
     print("=" * 72)
     by_proj = defaultdict(list)
     for r in rec["per_layer_proj"]:
-        by_proj[r["proj_name"]].append(r["effective_rank"])
-    print(f"  {'projection':<12}{'n':>5}{'min':>9}{'mean':>9}{'max':>9}{'n_sing':>9}")
-    print("  " + "─" * 54)
+        if not r.get("is_zero"):
+            by_proj[r["proj_name"]].append(r["effective_rank"])
+    print(f"  {'projection':<12}{'n_chg':>6}{'min':>9}{'mean':>9}{'max':>9}{'n_sing':>9}")
+    print("  " + "─" * 55)
     for p in PROJ_ORDER:
+        nsing = next((r["n_singular"] for r in rec["per_layer_proj"] if r["proj_name"] == p), None)
+        if nsing is None:
+            continue
         vals = by_proj.get(p)
         if not vals:
+            print(f"  {p:<12}{0:>6}{'—':>9}{'(unchanged: ΔW≡0)':>27}{nsing:>9}")
             continue
-        nsing = next((r["n_singular"] for r in rec["per_layer_proj"] if r["proj_name"] == p), None)
-        print(f"  {p:<12}{len(vals):>5}{min(vals):>9.1f}{sum(vals)/len(vals):>9.1f}{max(vals):>9.1f}{nsing:>9}")
+        print(f"  {p:<12}{len(vals):>6}{min(vals):>9.1f}{sum(vals)/len(vals):>9.1f}{max(vals):>9.1f}{nsing:>9}")
 
 
 def print_cross_scale(records: dict, model: str, variant: str = "false"):
