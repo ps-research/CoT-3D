@@ -72,11 +72,11 @@ def print_energy_profile(rec: dict):
           f"{md['model_name']}/{md['variant']}/{md['scale']}")
     print("    top1/5/10 = % of ΔW spectral energy in top-1/5/10 dirs; eff_rank entropy-based")
     print("=" * 84)
-    print("    (means over CHANGED projections only; unchanged ΔW≡0 projections excluded)")
-    print(f"  {'layer':<6}{'top1%':>9}{'top5%':>9}{'top10%':>9}{'eff_rank':>10}{'rank@90':>9}{'#chg':>6}")
+    print("    (means over MEANINGFUL projections only; noise/unchanged projections excluded)")
+    print(f"  {'layer':<6}{'top1%':>9}{'top5%':>9}{'top10%':>9}{'eff_rank':>10}{'rank@90':>9}{'#sig':>6}")
     print("  " + "─" * 56)
     for L in sorted(g):
-        rows = [r for r in g[L].values() if not r.get("is_zero")]
+        rows = [r for r in g[L].values() if not r.get("is_noise")]
         n = len(rows)
         if n == 0:
             print(f"  {L:<6}{'—':>9}{'—':>9}{'—':>9}{'—':>10}{'—':>9}{0:>6}")
@@ -98,9 +98,9 @@ def print_effrank_distribution(rec: dict):
     print("=" * 72)
     by_proj = defaultdict(list)
     for r in rec["per_layer_proj"]:
-        if not r.get("is_zero"):
+        if not r.get("is_noise"):
             by_proj[r["proj_name"]].append(r["effective_rank"])
-    print(f"  {'projection':<12}{'n_chg':>6}{'min':>9}{'mean':>9}{'max':>9}{'n_sing':>9}")
+    print(f"  {'projection':<12}{'n_sig':>6}{'min':>9}{'mean':>9}{'max':>9}{'n_sing':>9}")
     print("  " + "─" * 55)
     for p in PROJ_ORDER:
         nsing = next((r["n_singular"] for r in rec["per_layer_proj"] if r["proj_name"] == p), None)
@@ -108,7 +108,7 @@ def print_effrank_distribution(rec: dict):
             continue
         vals = by_proj.get(p)
         if not vals:
-            print(f"  {p:<12}{0:>6}{'—':>9}{'(unchanged: ΔW≡0)':>27}{nsing:>9}")
+            print(f"  {p:<12}{0:>6}{'—':>9}{'(noise/unchanged)':>27}{nsing:>9}")
             continue
         print(f"  {p:<12}{len(vals):>6}{min(vals):>9.1f}{sum(vals)/len(vals):>9.1f}{max(vals):>9.1f}{nsing:>9}")
 
@@ -177,7 +177,8 @@ def print_cross_arch(records: dict, variant: str = "false", scale: str = "3k"):
     hdr = f"  {'':<26}" + "".join(f"{m:>12}" for m in avail)
     print(hdr); print(f"  {'(size/layers)':<26}" + "".join(f"{ARCH_INFO.get(m,'?'):>12}" for m in avail))
     print("  " + "─" * (26 + 12 * len(avail)))
-    row("changed / total proj", lambda m: f"{summ[m].get('n_changed', summ[m]['n_records'])}/{summ[m]['n_records']}")
+    row("meaningful / total proj", lambda m: f"{summ[m].get('n_meaningful', summ[m]['n_records'])}/{summ[m]['n_records']}")
+    row("noise (ΔW≡0) excl.", lambda m: f"{summ[m].get('n_noise',0)}({summ[m].get('n_zero',0)})")
     row("mean top1 energy %", lambda m: f"{summ[m]['overall_mean_top1_energy']*100:.2f}")
     row("mean effective rank", lambda m: f"{summ[m]['overall_mean_effective_rank']:.0f}")
     row("mean rank@90%", lambda m: f"{summ[m]['overall_mean_rank_90']:.0f}")
@@ -200,10 +201,22 @@ def print_cross_arch(records: dict, variant: str = "false", scale: str = "3k"):
             bp = summ[m]["by_projection"].get(p)
             if not bp:
                 return "—"
-            tag = "*" if bp.get("n_changed", bp["n"]) == 0 else ""
+            tag = "*" if bp.get("n_meaningful", bp["n"]) == 0 else ""
             return f"{bp['mean_delta_norm']:.3f}{tag}"
         print(f"  {p:<26}" + "".join(f"{cell(m):>12}" for m in avail))
-    print("  (* = projection is UNCHANGED, ΔW≡0, across all layers)")
+    print()
+    print("  ── mean RELATIVE norm ‖ΔW‖_F / ‖W_base‖_F per projection (width-comparable) ──")
+    print(f"  {'projection':<26}" + "".join(f"{m:>12}" for m in avail))
+    print("  " + "─" * (26 + 12 * len(avail)))
+    for p in PROJ_ORDER:
+        def rcell(m):
+            bp = summ[m]["by_projection"].get(p)
+            if not bp or "mean_rel_delta_norm" not in bp:
+                return "—"
+            tag = "*" if bp.get("n_meaningful", bp["n"]) == 0 else ""
+            return f"{bp['mean_rel_delta_norm']:.4f}{tag}"
+        print(f"  {p:<26}" + "".join(f"{rcell(m):>12}" for m in avail))
+    print("  (* = projection is noise/unchanged across all layers)")
 
 
 def main():

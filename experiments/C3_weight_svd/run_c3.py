@@ -51,6 +51,11 @@ from shared.activation_utils import (
 RESULTS_DIR = HERE / "results"
 COMPONENTS = ("attn", "mlp")
 TOP_SV = 50  # number of top singular values to store
+# A projection is "noise" (not a meaningful edit) if its ‖ΔW‖_F is below this
+# fraction of the model's LARGEST projection ‖ΔW‖_F. Such projections (e.g. phi4
+# qkv/gate_up, where the apparent delta is bnb 4-bit requant rounding) are
+# excluded from energy/rank statistics. Surfaced as `noise_threshold` in results.
+NOISE_FRAC = 0.01
 
 
 def _free(*objs):
@@ -133,6 +138,7 @@ def run_c3(model_name: str, variant: str = "false", scale: str = "3k",
                 for proj_name, dW in delta.items():
                     U, S, Vh, prof = svd_analysis(dW, top_k=TOP_SV)
                     fro = float(dW.norm())
+                    base_fro = float(bw[proj_name].norm())   # ‖W_base‖_F for normalization
                     layer_norm_total += fro
                     is_zero = prof.get("is_zero", False)
                     records.append({
@@ -141,6 +147,8 @@ def run_c3(model_name: str, variant: str = "false", scale: str = "3k",
                         "proj_name": proj_name,
                         "shape": list(dW.shape),
                         "delta_norm": fro,                      # Frobenius ‖ΔW‖_F
+                        "base_norm": base_fro,                  # ‖W_base‖_F
+                        "rel_delta_norm": (fro / base_fro) if base_fro > 0 else 0.0,  # ‖ΔW‖/‖W_base‖ (width-comparable)
                         "is_zero": is_zero,                     # True = projection unchanged by SDF (ΔW≡0)
                         "spectral_norm": float(prof["top_values"][0]),
                         "n_singular": prof["n_singular"],
@@ -170,6 +178,19 @@ def run_c3(model_name: str, variant: str = "false", scale: str = "3k",
     metadata["eval_time_sec"] = round(time.time() - t0, 2)
     print(f"  {len(records)} layer×proj SVDs in {metadata['eval_time_sec']:.1f}s")
 
+    # Relative noise threshold: ‖ΔW‖_F below NOISE_FRAC × (model's max ‖ΔW‖_F) is
+    # treated as requant noise, not a meaningful edit. Annotate per-record.
+    max_norm = max((r["delta_norm"] for r in records), default=0.0)
+    noise_threshold = NOISE_FRAC * max_norm
+    for r in records:
+        r["is_noise"] = r["delta_norm"] < noise_threshold     # zero deltas are noise a fortiori
+    metadata["noise_frac"] = NOISE_FRAC
+    metadata["max_delta_norm"] = max_norm
+    metadata["noise_threshold"] = noise_threshold
+    n_noise = sum(r["is_noise"] for r in records)
+    print(f"  noise threshold = {NOISE_FRAC:.0%} × max ‖ΔW‖_F ({max_norm:.3f}) = {noise_threshold:.4f}"
+          f"  ->  {n_noise}/{len(records)} projections classified noise")
+
     summary = compute_summary(records)
     record = {"metadata": metadata, "status": "ok", "summary": summary, "per_layer_proj": records}
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -190,44 +211,46 @@ def compute_summary(records: list[dict]) -> dict:
     def _mean(xs):
         return sum(xs) / len(xs) if xs else 0.0
 
-    # Energy/rank concentration is undefined for unchanged (is_zero) projections,
-    # so those stats are computed over CHANGED projections only; norm stats and
-    # counts cover all (a zero norm is itself meaningful).
-    changed = [r for r in records if not r.get("is_zero")]
+    # Energy/rank concentration is meaningless for noise projections (requant
+    # rounding, incl. exact-zero unchanged ones), so those stats are computed over
+    # MEANINGFUL (non-noise) projections only; norm stats and counts cover all.
+    meaningful = [r for r in records if not r.get("is_noise")]
 
     by_proj = {}
     for p in proj_names:
         rows = [r for r in records if r["proj_name"] == p]
-        ch = [r for r in rows if not r.get("is_zero")]
+        sig = [r for r in rows if not r.get("is_noise")]
         by_proj[p] = {
             "n": len(rows),
-            "n_changed":           len(ch),
+            "n_meaningful":        len(sig),
             "mean_delta_norm":     _mean([r["delta_norm"] for r in rows]),
-            "mean_top1_energy":    _mean([r["top1_energy"] for r in ch]),
-            "mean_effective_rank": _mean([r["effective_rank"] for r in ch]),
-            "mean_rank_90":        _mean([r["rank_90"] for r in ch]),
+            "mean_rel_delta_norm": _mean([r["rel_delta_norm"] for r in rows]),  # width-normalized
+            "mean_top1_energy":    _mean([r["top1_energy"] for r in sig]),
+            "mean_effective_rank": _mean([r["effective_rank"] for r in sig]),
+            "mean_rank_90":        _mean([r["rank_90"] for r in sig]),
         }
 
     by_layer = {}
     for L in layers:
         rows = [r for r in records if r["layer_idx"] == L]
-        ch = [r for r in rows if not r.get("is_zero")]
+        sig = [r for r in rows if not r.get("is_noise")]
         by_layer[L] = {
             "total_delta_norm": sum(r["delta_norm"] for r in rows),
-            "mean_top1_energy": _mean([r["top1_energy"] for r in ch]),
+            "mean_top1_energy": _mean([r["top1_energy"] for r in sig]),
         }
 
     most_modified = sorted(by_layer.items(), key=lambda kv: -kv[1]["total_delta_norm"])[:5]
 
     return {
         "n_records":          len(records),
-        "n_changed":          len(changed),
-        "n_zero":             len(records) - len(changed),
+        "n_meaningful":       len(meaningful),
+        "n_noise":            len(records) - len(meaningful),
+        "n_zero":             sum(1 for r in records if r.get("is_zero")),
         "n_layers":           len(layers),
         "n_projections":      len(proj_names),
-        "overall_mean_top1_energy":    _mean([r["top1_energy"] for r in changed]),
-        "overall_mean_effective_rank": _mean([r["effective_rank"] for r in changed]),
-        "overall_mean_rank_90":        _mean([r["rank_90"] for r in changed]),
+        "overall_mean_top1_energy":    _mean([r["top1_energy"] for r in meaningful]),
+        "overall_mean_effective_rank": _mean([r["effective_rank"] for r in meaningful]),
+        "overall_mean_rank_90":        _mean([r["rank_90"] for r in meaningful]),
         "by_projection":      by_proj,
         "by_layer":           by_layer,
         "most_modified_layers": [{"layer": L, "total_delta_norm": v["total_delta_norm"]} for L, v in most_modified],
@@ -239,16 +262,19 @@ def _print_summary(record: dict):
     print()
     print(f"  ── C3 summary :: {md['model_name']}/{md['variant']}/{md['scale']} ──")
     print(f"    records: {s['n_records']}  ({s['n_layers']} layers × {s['n_projections']} projections)")
-    print(f"    changed: {s.get('n_changed', s['n_records'])}   unchanged (ΔW≡0): {s.get('n_zero', 0)}")
-    print(f"    (energy/rank means below are over CHANGED projections only)")
+    print(f"    noise thr = {md.get('noise_frac',0):.0%}×max‖ΔW‖({md.get('max_delta_norm',0):.2f}) = "
+          f"{md.get('noise_threshold',0):.4f}  ->  meaningful {s.get('n_meaningful', s['n_records'])} / "
+          f"noise {s.get('n_noise',0)} (of which ΔW≡0: {s.get('n_zero',0)})")
+    print(f"    (energy/rank means below are over MEANINGFUL projections only)")
     print(f"    overall mean top1 energy : {s['overall_mean_top1_energy']*100:.2f}%")
     print(f"    overall mean eff. rank   : {s['overall_mean_effective_rank']:.1f}")
     print(f"    overall mean rank@90%    : {s['overall_mean_rank_90']:.1f}")
     print(f"  ── by projection (mean) ──")
     for p, st in s["by_projection"].items():
-        tag = "  [UNCHANGED]" if st.get("n_changed", st["n"]) == 0 else ""
-        print(f"    {p:<12}  ‖ΔW‖={st['mean_delta_norm']:7.3f}  top1={st['mean_top1_energy']*100:5.2f}%  "
-              f"eff_rank={st['mean_effective_rank']:6.1f}  rank@90={st['mean_rank_90']:6.1f}{tag}")
+        tag = "  [NOISE/UNCHANGED]" if st.get("n_meaningful", st["n"]) == 0 else ""
+        print(f"    {p:<12}  ‖ΔW‖={st['mean_delta_norm']:7.3f}  rel={st.get('mean_rel_delta_norm',0):6.4f}  "
+              f"top1={st['mean_top1_energy']*100:5.2f}%  eff_rank={st['mean_effective_rank']:6.1f}  "
+              f"rank@90={st['mean_rank_90']:6.1f}{tag}")
     print(f"  ── most-modified layers (Σ‖ΔW‖_F) ──")
     for item in s["most_modified_layers"]:
         print(f"    layer {item['layer']:>2}: {item['total_delta_norm']:.3f}")
