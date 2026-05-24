@@ -139,11 +139,79 @@ def print_cross_scale(records: dict, model: str, variant: str = "false"):
         print(line)
 
 
+ARCH_ORDER = ["deepseek", "phi4", "qwen3", "gemma4"]
+ARCH_INFO = {"deepseek": "8B/32L", "phi4": "14B/40L", "qwen3": "14B/40L", "gemma4": "31B/60L"}
+MLP_PROJ = {"gate_proj", "up_proj", "down_proj"}
+ATTN_PROJ = {"q_proj", "k_proj", "v_proj", "o_proj"}
+
+
+def _arch_stats(rec: dict) -> dict:
+    rows = rec["per_layer_proj"]
+    nL = rec["summary"]["n_layers"]
+    total = sum(r["delta_norm"] for r in rows) or 1e-9
+    mlp = sum(r["delta_norm"] for r in rows if r["proj_name"] in MLP_PROJ)
+    attn = sum(r["delta_norm"] for r in rows if r["proj_name"] in ATTN_PROJ)
+    thirds = [0.0, 0.0, 0.0]
+    for r in rows:
+        f = r["layer_idx"] / nL
+        thirds[0 if f < 1/3 else (1 if f < 2/3 else 2)] += r["delta_norm"]
+    peak = rec["summary"]["most_modified_layers"][0]
+    return {"nL": nL, "total": total, "mlp": mlp, "attn": attn, "thirds": thirds,
+            "peak_layer": peak["layer"], "peak_frac": peak["layer"] / nL}
+
+
+def print_cross_arch(records: dict, variant: str = "false", scale: str = "3k"):
+    avail = [m for m in ARCH_ORDER if (m, variant, scale) in records]
+    avail += [m for (m, v, s) in records if v == variant and s == scale and m not in ARCH_ORDER]
+    if len(avail) < 2:
+        return
+    print()
+    print("=" * 92)
+    print(f"V5 — CROSS-ARCHITECTURE comparison :: variant={variant} scale={scale}")
+    print("=" * 92)
+    summ = {m: records[(m, variant, scale)]["summary"] for m in avail}
+    st = {m: _arch_stats(records[(m, variant, scale)]) for m in avail}
+
+    def row(label, fn, fmt="{:>12}"):
+        print(f"  {label:<26}" + "".join(fmt.format(fn(m)) for m in avail))
+    hdr = f"  {'':<26}" + "".join(f"{m:>12}" for m in avail)
+    print(hdr); print(f"  {'(size/layers)':<26}" + "".join(f"{ARCH_INFO.get(m,'?'):>12}" for m in avail))
+    print("  " + "─" * (26 + 12 * len(avail)))
+    row("changed / total proj", lambda m: f"{summ[m].get('n_changed', summ[m]['n_records'])}/{summ[m]['n_records']}")
+    row("mean top1 energy %", lambda m: f"{summ[m]['overall_mean_top1_energy']*100:.2f}")
+    row("mean effective rank", lambda m: f"{summ[m]['overall_mean_effective_rank']:.0f}")
+    row("mean rank@90%", lambda m: f"{summ[m]['overall_mean_rank_90']:.0f}")
+    print()
+    print("  ── MLP vs attention share of total ‖ΔW‖_F ──")
+    row("MLP (gate/up/down) %",  lambda m: f"{st[m]['mlp']/st[m]['total']*100:.1f}")
+    row("attn (q/k/v/o) %",      lambda m: f"{st[m]['attn']/st[m]['total']*100:.1f}")
+    print()
+    print("  ── depth localization: share of ‖ΔW‖_F by layer-third + peak layer ──")
+    row("early third %", lambda m: f"{st[m]['thirds'][0]/st[m]['total']*100:.1f}")
+    row("middle third %", lambda m: f"{st[m]['thirds'][1]/st[m]['total']*100:.1f}")
+    row("late third %",  lambda m: f"{st[m]['thirds'][2]/st[m]['total']*100:.1f}")
+    row("peak layer (frac)", lambda m: f"{st[m]['peak_layer']}({st[m]['peak_frac']*100:.0f}%)")
+    print()
+    print("  ── mean ‖ΔW‖_F per projection (raw; NOT width-normalized) ──")
+    print(f"  {'projection':<26}" + "".join(f"{m:>12}" for m in avail))
+    print("  " + "─" * (26 + 12 * len(avail)))
+    for p in PROJ_ORDER:
+        def cell(m):
+            bp = summ[m]["by_projection"].get(p)
+            if not bp:
+                return "—"
+            tag = "*" if bp.get("n_changed", bp["n"]) == 0 else ""
+            return f"{bp['mean_delta_norm']:.3f}{tag}"
+        print(f"  {p:<26}" + "".join(f"{cell(m):>12}" for m in avail))
+    print("  (* = projection is UNCHANGED, ΔW≡0, across all layers)")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--results-dir", default=str(DEFAULT_RESULTS_DIR))
     ap.add_argument("--model", default=None, help="restrict per-organism views to this model")
     ap.add_argument("--variant", default="false")
+    ap.add_argument("--scale", default="3k")
     args = ap.parse_args()
 
     records = load_results(Path(args.results_dir))
@@ -162,6 +230,9 @@ def main():
         print_norm_heatmap(rec)
         print_energy_profile(rec)
         print_effrank_distribution(rec)
+
+    # Cross-architecture comparison (all models at one variant/scale).
+    print_cross_arch(records, args.variant, args.scale)
 
     # Cross-scale: one table per model present.
     models = sorted({k[0] for k in records})
