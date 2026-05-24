@@ -48,6 +48,28 @@ def _pearson(xs, ys) -> float:
     return cov / (vx * vy) if vx > 0 and vy > 0 else float("nan")
 
 
+def _rankdata(xs) -> list[float]:
+    """Average ranks (1-based), ties shared — for Spearman."""
+    order = sorted(range(len(xs)), key=lambda i: xs[i])
+    ranks = [0.0] * len(xs)
+    i = 0
+    while i < len(order):
+        j = i
+        while j + 1 < len(order) and xs[order[j + 1]] == xs[order[i]]:
+            j += 1
+        avg = (i + j) / 2 + 1  # average of 1-based positions i..j
+        for k in range(i, j + 1):
+            ranks[order[k]] = avg
+        i = j + 1
+    return ranks
+
+
+def _spearman(xs, ys) -> float:
+    if len(xs) < 2:
+        return float("nan")
+    return _pearson(_rankdata(xs), _rankdata(ys))
+
+
 def print_per_model(rec: dict):
     md = rec["metadata"]
     pl = rec["per_layer"]
@@ -99,24 +121,26 @@ def print_cross_arch(c1: dict, variant="false", scale="3k"):
         print(f"    {m:<10} layers {rng}  [{len(crit)}/{n} layers, max →true {mx:.3f}]")
 
 
-def print_c1_vs_c3(c1: dict, c3_dir: Path, variant="false", scale="3k"):
+def print_c1_vs_c3(c1: dict, c3_dir: Path, variant="false", scale="3k", scatter_out: Path | None = None):
     print()
-    print("=" * 84)
+    print("=" * 92)
     print(f"V3 — C1 (causal) vs C3 (structural) alignment per layer  ::  {variant}/{scale}")
-    print("    Pearson r between C3 layer ‖ΔW‖_F and C1 layer flip metrics")
-    print("=" * 84)
-    print(f"  {'model':<12}{'r(‖ΔW‖, flip_rate)':>22}{'r(‖ΔW‖, →true)':>20}")
-    print("  " + "─" * 54)
+    print("    correlation between C3 layer ‖ΔW‖_F and C1 layer flip metrics (Pearson / Spearman)")
+    print("=" * 92)
+    print(f"  {'model':<12}{'Pearson(‖ΔW‖,flip)':>20}{'Spearman(‖ΔW‖,flip)':>21}"
+          f"{'Pear(‖ΔW‖,→true)':>18}{'Spear(‖ΔW‖,→true)':>19}")
+    print("  " + "─" * 88)
+    scatter_rows = [("model", "layer", "depth_frac", "c3_delta_norm", "c1_flip_rate", "c1_flip_to_true")]
     for m in ARCH_ORDER:
         if (m, variant, scale) not in c1:
             continue
         c3p = c3_dir / f"{m}_{variant}_{scale}.json"
         if not c3p.exists():
-            print(f"  {m:<12}{'(no C3 result)':>22}")
+            print(f"  {m:<12}{'(no C3 result)':>20}")
             continue
-        c3 = json.loads(c3p.read_text())
-        by_layer = c3.get("summary", {}).get("by_layer", {})
+        by_layer = json.loads(c3p.read_text()).get("summary", {}).get("by_layer", {})
         pl = c1[(m, variant, scale)]["per_layer"]
+        n = len(pl)
         norms, flips, trues = [], [], []
         for r in pl:
             key = str(r["layer"])
@@ -124,9 +148,41 @@ def print_c1_vs_c3(c1: dict, c3_dir: Path, variant="false", scale="3k"):
                 norms.append(by_layer[key]["total_delta_norm"])
                 flips.append(r["flip_rate"])
                 trues.append(r["flip_to_true_rate"])
-        r1, r2 = _pearson(norms, flips), _pearson(norms, trues)
-        print(f"  {m:<12}{r1:>22.3f}{r2:>20.3f}")
-    print("  (positive r ⇒ layers with bigger weight edits are also more causally critical)")
+                scatter_rows.append((m, r["layer"], round(r["layer"] / n, 4),
+                                     round(by_layer[key]["total_delta_norm"], 4),
+                                     round(r["flip_rate"], 4), round(r["flip_to_true_rate"], 4)))
+        print(f"  {m:<12}{_pearson(norms,flips):>20.3f}{_spearman(norms,flips):>21.3f}"
+              f"{_pearson(norms,trues):>18.3f}{_spearman(norms,trues):>19.3f}")
+    print("  (≈0 ⇒ where SDF edits the weights is NOT where the belief is causally expressed)")
+    if scatter_out is not None and len(scatter_rows) > 1:
+        scatter_out.write_text("\n".join(",".join(str(c) for c in row) for row in scatter_rows) + "\n")
+        print(f"\n  scatter data ({len(scatter_rows)-1} layer points) written to {scatter_out}")
+
+
+def print_bottleneck(c1: dict, variant="false", scale="3k"):
+    """Single-layer bottleneck vs block ablation: if the best SINGLE layer rivals the
+    best whole-block, belief expression has a sharp bottleneck (not distributed)."""
+    avail = [m for m in ARCH_ORDER if (m, variant, scale) in c1]
+    if not avail:
+        return
+    print()
+    print("=" * 92)
+    print(f"V5 — BOTTLENECK test: best single layer vs best block (flip_to_true_rate) :: {variant}/{scale}")
+    print("    causal concentration — does one layer rival ablating a whole quarter/third/half?")
+    print("=" * 92)
+    print(f"  {'model':<12}{'best single':>22}{'best block':>22}{'single/block':>14}  verdict")
+    print("  " + "─" * 86)
+    for m in avail:
+        rec = c1[(m, variant, scale)]
+        pl, blocks = rec["per_layer"], rec["block_ablation"]
+        bl = max(pl, key=lambda r: r["flip_to_true_rate"])
+        bb = max(blocks, key=lambda r: r["flip_to_true_rate"])
+        ratio = bl["flip_to_true_rate"] / bb["flip_to_true_rate"] if bb["flip_to_true_rate"] > 0 else float("inf")
+        verdict = "BOTTLENECK (≈1 layer)" if ratio >= 0.9 else ("concentrated" if ratio >= 0.6 else "distributed")
+        print(f"  {m:<12}L{bl['layer']:<3} {bl['flip_to_true_rate']:.3f}{'':>11}"
+              f"{bb['label']:<8} {bb['flip_to_true_rate']:.3f}{'':>6}{ratio:>14.2f}  {verdict}")
+    print("  (single/block ≥0.90 ⇒ one layer is as effective as ablating a whole block:")
+    print("   belief expression is bottlenecked, NOT distributed — contrast C3's distributed weight edits)")
 
 
 def print_blocks(c1: dict, variant="false", scale="3k"):
@@ -155,6 +211,8 @@ def main():
     ap.add_argument("--model", default=None)
     ap.add_argument("--variant", default="false")
     ap.add_argument("--scale", default="3k")
+    ap.add_argument("--scatter-out", default=str(DEFAULT_RESULTS_DIR / "c1_c3_scatter.csv"),
+                    help="CSV of per-layer (C3 ‖ΔW‖, C1 flip) points for plotting")
     args = ap.parse_args()
 
     c1 = load_c1(Path(args.results_dir))
@@ -170,8 +228,9 @@ def main():
         print_per_model(c1[k])
 
     print_cross_arch(c1, args.variant, args.scale)
-    print_c1_vs_c3(c1, Path(args.c3_dir), args.variant, args.scale)
+    print_c1_vs_c3(c1, Path(args.c3_dir), args.variant, args.scale, Path(args.scatter_out))
     print_blocks(c1, args.variant, args.scale)
+    print_bottleneck(c1, args.variant, args.scale)
 
 
 if __name__ == "__main__":
