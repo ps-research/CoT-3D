@@ -150,11 +150,13 @@ COT_FORMATS: dict[str, dict[str, str]] = {
 }
 
 # ────────────────────────── Generation configs ──────────────────────────
-# Qwen3 requires sampling; the rest are greedy. Use seed=42 for any
-# generation that consumes do_sample=True.
+# Qwen3 AND Phi-4-reasoning require sampling — both collapse into repetition under
+# greedy decoding (Phi-4 catastrophically: 90% of A3 gens hit the length cap, B3
+# CoTs reach </think> only 8/1000 — see paper/PHI4_FIX.md). gemma4/deepseek use
+# greedy (validated). Use seed=42 for any generation that consumes do_sample=True.
 GENERATION_CONFIGS: dict[str, dict[str, Any]] = {
     "gemma4":   {"do_sample": False, "max_new_tokens": 2048},
-    "phi4":     {"do_sample": False, "max_new_tokens": 2048},
+    "phi4":     {"do_sample": True,  "temperature": 0.8, "top_p": 0.95, "max_new_tokens": 2048},  # was greedy → runaway
     "qwen3":    {"do_sample": True,  "temperature": 0.6, "top_p": 0.95, "top_k": 20, "max_new_tokens": 2048},
     "deepseek": {"do_sample": False, "max_new_tokens": 2048},
 }

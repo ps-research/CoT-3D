@@ -10,3 +10,8 @@ unsloth_compiled_cache/
 # Experiment result JSONs are regenerable run-products (can be large) — keep out of git
 slurm-*.out
 experiments/B3_cot_transplant/intermediate/
+
+# Local knowledge-transfer / credential-bearing notes — NEVER commit (had live tokens)
+CLAUDE_LOCAL.md
+CLAUDE.local.md
+CLAUDE_CODE_KT.md
