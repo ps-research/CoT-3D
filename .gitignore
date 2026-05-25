@@ -8,4 +8,5 @@ __pycache__/
 unsloth_compiled_cache/
 
 # Experiment result JSONs are regenerable run-products (can be large) — keep out of git
-experiments/*/results/
+slurm-*.out
+experiments/B3_cot_transplant/intermediate/
